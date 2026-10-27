@@ -1,6 +1,4 @@
----
-
-# One Parameter Too Many: Duplicating Coupon Discounts with an Undocumented `count` in Intigriti's Challenge 1026
+# The Guard Only Checked the Last Coupon: Stacking Coupon Discounts to €0.00 in Intigriti's Challenge 1026
 
 ## The challenge
 
@@ -33,43 +31,40 @@ Applied normally to the €666.00 product:
 - NIGHT20 → −€133.20 (total €532.80)
 - NEWS30 → −€199.80 (total **€333.00**)
 
-€333.00 is still far above the €66.00 credit. Re-applying a coupon is correctly rejected with `409 coupon_already_applied`. Removing and re-applying is idempotent — the discounts are computed from the subtotal, so there's no stacking loop there.
+€333.00 is still far above the €66.00 credit. Re-applying the same coupon twice in a row is rejected with `409 coupon_already_applied`. Removing and re-applying is idempotent — the discounts are computed from the subtotal, so there's no stacking loop there.
 
-Dead end? Not quite. The interesting question with any "already applied" guard is: *what exactly does the server check, and what else does it accept?*
+Dead end? Not quite. The interesting question with any "already applied" guard is: *what exactly does the server check — the whole cart, or just the last thing you did?*
 
-## The bug: an undocumented `count` parameter
+## The bug: a duplicate check that only looks at the last coupon
 
-The coupon endpoint binds the request JSON to a server-side object — and that object has more fields than the frontend uses. Re-applying an already-applied coupon with one extra field changes everything:
+Every promotion in the cart is an object `{"code", "percent", "amount", "count"}` — and the UI even has a branch that renders `× 2`, `× 3` when `count > 1`. So a coupon *can* be counted more than once. The question is what makes the server raise the count.
 
-```http
-POST /api/cart/coupon
-Content-Type: application/json
+The answer is the duplicate guard's scope. It compares the incoming code **only against the most recently applied promotion**, not against the whole cart:
 
-{"code": "NIGHT20", "count": 5}
-```
+- `NIGHT20` right after `NIGHT20` → `409 coupon_already_applied`
+- `NIGHT20` right after `NEWS30` → **200**, and NIGHT20's `count` goes 1 → 2, its `amount` doubling to −€266.40
 
-Instead of `409 coupon_already_applied`, the server returns **200** and the promotion's counter goes from 1 → 2. The discount is applied **twice**: −€266.40 instead of −€133.20.
+Alternating the two codes walks straight past the guard: `NIGHT20 → NEWS30 → NIGHT20 → NEWS30` leaves each promotion at `count: 2`, the combined discount reaches 100% of the subtotal, and the total clamps to €0.00.
 
-This is a classic **mass assignment** flaw: the client can write to an internal field (`count`, the number of times a promotion is applied) that should only ever be managed by the server. The `coupon_already_applied` guard is bypassed because the request is no longer treated as a duplicate application — the bound `count` makes it a *modification* of the existing promotion.
+Notes from testing the guard:
 
-Notes from testing the parameter:
+- The 409 is purely about repetition: the same code twice **in a row** is the only rejected case. Extra fields in the coupon body (`count`, `percent`, `amount`) change nothing — the server recomputes everything from `code` and its own cart state.
+- There is **no per-coupon cap**: as long as applications alternate, the count keeps rising (verified up to `count: 3` on one promotion).
+- Sending extra fields on the *first* application does nothing either (the promotion is created with count 1).
 
-- The actual value doesn't matter — `count: 5` still results in count 2. The server increments by one; it does not set the value.
-- It works **exactly once per coupon**: a second bump (2 → 3) returns 409.
-- Sending `count` on the *first* application does nothing (applies with count 1).
-- Negative, zero, or string values for `count` return 409 — no type-confusion shortcut, the increment path is the whole bug.
+*(An earlier version of this write-up attributed the increment to an undocumented `count` field in the request body. That was wrong — see the correction note at the end. The field is ignored; the repeated application itself, slipped past a guard that only remembers the last coupon, is the whole bug.)*
 
 ## Exploitation: €666.00 → €0.00
 
-With two coupons, each bumpable once, the discounts double:
+Alternating the two coupons, each one counts twice and the discounts double:
 
 1. `GET /api/session` → credit €66.00
 2. `POST /api/newsletter` `{"email":"poc@example.com"}` → unlocks `NEWS30`
 3. `POST /api/cart/items` `{"productId":"midnight-vault"}` → €666.00
 4. `POST /api/cart/coupon` `{"code":"NIGHT20"}` → −€133.20 → **€532.80**
 5. `POST /api/cart/coupon` `{"code":"NEWS30"}` → −€199.80 → **€333.00**
-6. `POST /api/cart/coupon` `{"code":"NIGHT20","count":5}` → −€266.40 → **€199.80**
-7. `POST /api/cart/coupon` `{"code":"NEWS30","count":5}` → −€399.60 → **€0.00**
+6. `POST /api/cart/coupon` `{"code":"NIGHT20"}` → NIGHT20 `count: 2` → **€199.80**
+7. `POST /api/cart/coupon` `{"code":"NEWS30"}` → NEWS30 `count: 2` → **€0.00**
 8. `POST /api/checkout` `{}` → 200, receipt with the flag
 
 Total paid: **€0.00**. Order `BLE-D10F75B43C`, flag captured:
@@ -80,24 +75,25 @@ INTIGRITI{094638e6-ba2f-4c50-8bb4-41ced0d5debd}
 
 ## What didn't work (and why it matters)
 
-A good challenge punishes the obvious paths, and this one was well-built everywhere except the one field:
+A good challenge punishes the obvious paths, and this one was well-built everywhere except one comparison:
 
 - **Mass assignment on cart items** — extra `price`, `quantity`, or `count` fields on `POST /api/cart/items` are ignored.
 - **Checkout tampering** — injecting `total` or `credit` into `POST /api/checkout` returns `402 insufficient_credit`; the server validates against its own state.
 - **Coupon gating done right** — `NEWS30` without a prior newsletter call returns `400 newsletter_required`. Unknown codes return 400; codes are case-insensitive.
 - **Remove/re-apply stacking** — idempotent, discounts always recomputed from the subtotal.
 
-That's exactly why the `count` bug is instructive: the application validated *totals*, *gating*, and *duplicates* — but the duplicate check could be sidestepped by writing to an internal counter the API never meant to expose.
+That's exactly why this bug is instructive: the application validated *totals*, *gating*, and *duplicates* — but its duplicate check only ever looked at the last promotion applied, so interleaving two valid codes walked straight past it.
 
 ## Lessons
 
-1. **Every JSON field the server binds is attack surface.** If the request model has a field the UI never sends, fuzz it — especially counters, quantities, and multiplicities on money-moving endpoints.
-2. **"Already applied" guards need to be state checks, not request-shape checks.** If adding a field changes how the server classifies the request, the guard is cosmetic.
-3. **Whitelist, don't bind.** Server-side DTOs for coupon application should contain exactly one field: `code`. Everything else should be rejected or ignored — and internal counters should never be client-writable.
+1. **Response fields are a map of server state.** A `count` the client never sends but the server maintains — with UI support for `×N` — means the server supports multiplicity. Ask *which sequence of legitimate operations raises it* before assuming it can be written directly.
+2. **Uniqueness guards must check the whole set, not the last element.** A duplicate check that only compares against the most recent entry is an invitation to interleave: alternate two valid codes and each re-application looks "new" to the guard.
+3. **Cap the aggregate, not just the item.** Even with a correct duplicate check, the server should clamp the combined discount to the subtotal and re-validate the total at checkout. Two independent controls; either one alone would have stopped this.
 
 ## Timeline
 
 - Report submitted to the Challenge 1026 program with a verified PoC (re-run from a fresh session before submitting).
 - **Accepted** by Intigriti on 2026-10-20 (severity: Medium, type: Improper Input Validation).
+- **Correction (2026-10-27):** the first published version of this write-up attributed the bug to a client-supplied `count` parameter (mass assignment). Re-testing with discriminating controls — the same alternating sequence *without* the field (solves identically, order `BLE-150A57C6F9`) and the field on a *consecutive* re-application (returns 409) — proved the field is ignored and the guard's scope is the bug. The result never changed; the explanation now matches the evidence.
 
 *Write-up prepared for the Intigriti write-up competition — publication held until the challenge ends, as requested.*
